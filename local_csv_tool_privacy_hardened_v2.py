@@ -20,7 +20,6 @@ def mb_to_bytes(value):
 
 def reset_uploads():
     st.session_state["upload_version"] = st.session_state.get("upload_version", 0) + 1
-    st.session_state.pop("last_status_data", None)
 
 
 def get_upload_size(uploaded_file):
@@ -305,7 +304,6 @@ if zip_ref and zip_target:
                 return "background-color: #f8d7da"
             return "background-color: #fff3cd"
 
-        st.session_state["last_status_data"] = status_data
         st.dataframe(pd.DataFrame(status_data).style.map(color_status, subset=["status"]), use_container_width=True)
     else:
         st.warning("⚠️ no auto-matches found. check settings or use manual pairing.")

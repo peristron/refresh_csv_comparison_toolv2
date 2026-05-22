@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import zipfile
 
 import pandas as pd
@@ -12,6 +13,8 @@ MAX_TOTAL_UNCOMPRESSED_MB = 500
 MAX_CSV_FILE_MB = 100
 MAX_CSV_COUNT = 500
 MAX_COMPRESSION_RATIO = 100
+OLD_ROLE_SUFFIX_TOKENS = {"old", "reference", "ref", "before", "previous", "baseline"}
+NEW_ROLE_SUFFIX_TOKENS = {"new", "target", "after", "updated", "current"}
 
 
 def mb_to_bytes(value):
@@ -122,6 +125,19 @@ def normalize_filename(filename, prefix="", suffix_delimiter=""):
     return name_no_ext
 
 
+def strip_role_suffix_tokens(normalized_name, role):
+    role_tokens = OLD_ROLE_SUFFIX_TOKENS if role == "old" else NEW_ROLE_SUFFIX_TOKENS
+    parts = [part for part in re.split(r"[_\-\s]+", normalized_name) if part]
+    if not parts:
+        return normalized_name
+
+    while len(parts) > 1 and parts[-1].lower() in role_tokens:
+        parts.pop()
+
+    stripped_name = "_".join(parts)
+    return stripped_name or normalized_name
+
+
 def build_normalized_object_map(objects, name_getter, prefix="", suffix_delimiter=""):
     object_map = {}
     collisions = {}
@@ -136,6 +152,57 @@ def build_normalized_object_map(objects, name_getter, prefix="", suffix_delimite
             object_map[normalized_name] = obj
 
     return object_map, collisions
+
+
+def build_zip_pair_maps(old_zip_files, new_zip_files, old_zip_prefix, new_zip_prefix, zip_suffix_sep):
+    old_zip_map, old_zip_collisions = build_normalized_object_map(
+        old_zip_files,
+        uploaded_name,
+        old_zip_prefix,
+        zip_suffix_sep,
+    )
+    new_zip_map, new_zip_collisions = build_normalized_object_map(
+        new_zip_files,
+        uploaded_name,
+        new_zip_prefix,
+        zip_suffix_sep,
+    )
+    common_zip_keys = sorted(set(old_zip_map.keys()).intersection(set(new_zip_map.keys())))
+
+    if common_zip_keys:
+        return {
+            "old_zip_map": old_zip_map,
+            "new_zip_map": new_zip_map,
+            "old_zip_collisions": old_zip_collisions,
+            "new_zip_collisions": new_zip_collisions,
+            "common_zip_keys": common_zip_keys,
+            "match_mode": "exact",
+        }
+
+    old_zip_map, old_zip_collisions = build_normalized_object_map(
+        old_zip_files,
+        lambda item: strip_role_suffix_tokens(
+            normalize_filename(uploaded_name(item), old_zip_prefix, zip_suffix_sep),
+            "old",
+        ),
+    )
+    new_zip_map, new_zip_collisions = build_normalized_object_map(
+        new_zip_files,
+        lambda item: strip_role_suffix_tokens(
+            normalize_filename(uploaded_name(item), new_zip_prefix, zip_suffix_sep),
+            "new",
+        ),
+    )
+    common_zip_keys = sorted(set(old_zip_map.keys()).intersection(set(new_zip_map.keys())))
+
+    return {
+        "old_zip_map": old_zip_map,
+        "new_zip_map": new_zip_map,
+        "old_zip_collisions": old_zip_collisions,
+        "new_zip_collisions": new_zip_collisions,
+        "common_zip_keys": common_zip_keys,
+        "match_mode": "role_suffix_fallback" if common_zip_keys else "none",
+    }
 
 
 def drop_ignored_columns(df, ignore_cols):
@@ -386,6 +453,7 @@ with st.expander("how to use this app", expanded=True):
         """
         1. upload one or more **old/reference ZIPs** and the matching **new/target ZIPs** in the sidebar.
         2. use the **ZIP auto-match logic** settings if old and new ZIP filenames need normalization before pairing.
+           The app can also fall back to common trailing role words such as `old`, `reference`, `new`, and `target`.
         3. use the **CSV auto-match logic** settings if filenames inside the ZIPs need normalization before pairing.
         4. list columns to ignore, such as load timestamps, run IDs, or batch IDs.
         5. review the **global status report** across all auto-paired ZIP sets.
@@ -444,21 +512,26 @@ if old_zip_files and new_zip_files:
             st.error(message)
         st.stop()
 
-    old_zip_map, old_zip_collisions = build_normalized_object_map(
+    zip_pairing = build_zip_pair_maps(
         valid_old_zip_files,
-        uploaded_name,
-        old_zip_prefix,
-        zip_suffix_sep,
-    )
-    new_zip_map, new_zip_collisions = build_normalized_object_map(
         valid_new_zip_files,
-        uploaded_name,
+        old_zip_prefix,
         new_zip_prefix,
         zip_suffix_sep,
     )
-    common_zip_keys = sorted(set(old_zip_map.keys()).intersection(set(new_zip_map.keys())))
+    old_zip_map = zip_pairing["old_zip_map"]
+    new_zip_map = zip_pairing["new_zip_map"]
+    old_zip_collisions = zip_pairing["old_zip_collisions"]
+    new_zip_collisions = zip_pairing["new_zip_collisions"]
+    common_zip_keys = zip_pairing["common_zip_keys"]
     unmatched_old_zip_keys = sorted(set(old_zip_map.keys()).difference(set(new_zip_map.keys())))
     unmatched_new_zip_keys = sorted(set(new_zip_map.keys()).difference(set(old_zip_map.keys())))
+
+    if zip_pairing["match_mode"] == "role_suffix_fallback":
+        st.info(
+            "ZIP pairs were matched using fallback role-word stripping for trailing names such as "
+            "`old`/`reference` and `new`/`target`."
+        )
 
     if old_zip_collisions or new_zip_collisions:
         st.warning(
@@ -476,6 +549,11 @@ if old_zip_files and new_zip_files:
             st.caption(f"unmatched old ZIP keys: {', '.join(unmatched_old_zip_keys)}")
         if unmatched_new_zip_keys:
             st.caption(f"unmatched new ZIP keys: {', '.join(unmatched_new_zip_keys)}")
+        if zip_pairing["match_mode"] == "none":
+            st.caption(
+                "Tip: if your ZIP names end with phrases like `_old_reference` and `_new_target`, "
+                "either remove those suffixes in ZIP auto-match logic or rely on the fallback role-word pairing."
+            )
 
     pair_results = []
     for zip_key in common_zip_keys:

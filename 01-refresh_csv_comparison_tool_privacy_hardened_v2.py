@@ -25,6 +25,15 @@ def mb_to_bytes(value):
     return value * 1024 * 1024
 
 
+def uploaded_name(uploaded_file):
+    return getattr(uploaded_file, "name", "uploaded.zip")
+
+
+def sanitize_filename_part(value):
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in value)
+    return cleaned.strip("_") or "report"
+
+
 def reset_uploads():
     st.session_state["upload_version"] = st.session_state.get("upload_version", 0) + 1
 
@@ -154,19 +163,24 @@ def normalize_filename(filename, prefix="", suffix_delimiter=""):
     return name_no_ext
 
 
-def build_normalized_map(file_list, prefix="", suffix_delimiter=""):
-    file_map = {}
+def build_normalized_object_map(objects, name_getter, prefix="", suffix_delimiter=""):
+    object_map = {}
     collisions = {}
 
-    for file_name in file_list:
-        normalized_name = normalize_filename(file_name, prefix, suffix_delimiter)
-        if normalized_name in file_map:
-            collisions.setdefault(normalized_name, [file_map[normalized_name]]).append(file_name)
-            file_map.pop(normalized_name, None)
+    for obj in objects:
+        object_name = name_getter(obj)
+        normalized_name = normalize_filename(object_name, prefix, suffix_delimiter)
+        if normalized_name in object_map:
+            collisions.setdefault(normalized_name, [name_getter(object_map[normalized_name])]).append(object_name)
+            object_map.pop(normalized_name, None)
         elif normalized_name not in collisions:
-            file_map[normalized_name] = file_name
+            object_map[normalized_name] = obj
 
-    return file_map, collisions
+    return object_map, collisions
+
+
+def drop_ignored_columns(df, ignore_cols):
+    return df.drop(columns=[c for c in ignore_cols if c in df.columns], errors="ignore").copy()
 
 
 def read_csv_from_zip(zip_file, full_path):
@@ -194,8 +208,8 @@ def compare_dataframes(df1, df2, ignore_cols):
     if df1 is None or df2 is None:
         return "Error", None
 
-    df1 = df1.drop(columns=[c for c in ignore_cols if c in df1.columns], errors="ignore").copy()
-    df2 = df2.drop(columns=[c for c in ignore_cols if c in df2.columns], errors="ignore").copy()
+    df1 = drop_ignored_columns(df1, ignore_cols)
+    df2 = drop_ignored_columns(df2, ignore_cols)
 
     if set(df1.columns) != set(df2.columns):
         return "Schema Diff", None
@@ -225,6 +239,14 @@ def compare_dataframes(df1, df2, ignore_cols):
     return "Data Mismatch", pd.DataFrame(diff_rows)
 
 
+def color_status(value):
+    if "Match" in value:
+        return "background-color: #d4edda"
+    if "Error" in value:
+        return "background-color: #f8d7da"
+    return "background-color: #fff3cd"
+
+
 def display_diff_results(status, diff_df, rows_old, rows_new):
     m1, m2, m3 = st.columns(3)
     m1.metric("rows in old file", rows_old)
@@ -240,13 +262,162 @@ def display_diff_results(status, diff_df, rows_old, rows_new):
         diff_count = len(diff_df)
         m3.metric("rows with differences", diff_count, delta_color="inverse")
         st.warning(f"Found {diff_count} differing row instance(s).")
-        removed = diff_df[diff_df["_source"] == "OLD"].drop(columns=["_source"])
-        added = diff_df[diff_df["_source"] == "NEW"].drop(columns=["_source"])
-        t1, t2 = st.tabs([f"rows removed ({len(removed)})", f"rows added ({len(added)})"])
+        old_diff = diff_df[diff_df["_source"] == "OLD"].drop(columns=["_source"])
+        new_diff = diff_df[diff_df["_source"] == "NEW"].drop(columns=["_source"])
+        t1, t2 = st.tabs([f"old differing rows ({len(old_diff)})", f"new differing rows ({len(new_diff)})"])
         with t1:
-            st.dataframe(removed, use_container_width=True)
+            st.dataframe(old_diff, use_container_width=True)
         with t2:
-            st.dataframe(added, use_container_width=True)
+            st.dataframe(new_diff, use_container_width=True)
+
+
+def validate_uploaded_group(uploaded_files, label_prefix):
+    errors = []
+    valid_files = []
+
+    for index, zip_file in enumerate(uploaded_files, start=1):
+        label = f"{label_prefix} {index}: {uploaded_name(zip_file)}"
+        is_valid, message = validate_zip_upload(zip_file, label)
+        if is_valid:
+            valid_files.append(zip_file)
+        else:
+            errors.append(message)
+
+    return valid_files, errors
+
+
+def analyze_zip_pair(
+    old_zip,
+    new_zip,
+    zip_pair_key,
+    old_csv_prefix,
+    new_csv_prefix,
+    csv_suffix_sep,
+    ignore_list,
+):
+    old_csv_files = get_file_list(old_zip)
+    new_csv_files = get_file_list(new_zip)
+    old_csv_map, old_csv_collisions = build_normalized_object_map(
+        old_csv_files,
+        lambda item: item,
+        old_csv_prefix,
+        csv_suffix_sep,
+    )
+    new_csv_map, new_csv_collisions = build_normalized_object_map(
+        new_csv_files,
+        lambda item: item,
+        new_csv_prefix,
+        csv_suffix_sep,
+    )
+    common_csv_keys = sorted(set(old_csv_map.keys()).intersection(set(new_csv_map.keys())))
+
+    status_rows = []
+    for csv_key in common_csv_keys:
+        old_df = read_csv_from_zip(old_zip, old_csv_map[csv_key])
+        new_df = read_csv_from_zip(new_zip, new_csv_map[csv_key])
+        status, diff_df = compare_dataframes(old_df, new_df, ignore_list)
+        status_rows.append(
+            {
+                "zip pair": zip_pair_key,
+                "normalized csv name": csv_key,
+                "status": status,
+                "rows old": old_df.shape[0] if old_df is not None else 0,
+                "rows new": new_df.shape[0] if new_df is not None else 0,
+                "diff rows": len(diff_df) if diff_df is not None else 0,
+                "old zip": uploaded_name(old_zip),
+                "new zip": uploaded_name(new_zip),
+                "old file": old_csv_map[csv_key],
+                "new file": new_csv_map[csv_key],
+            }
+        )
+
+    return {
+        "zip_pair_key": zip_pair_key,
+        "old_zip": old_zip,
+        "new_zip": new_zip,
+        "old_zip_name": uploaded_name(old_zip),
+        "new_zip_name": uploaded_name(new_zip),
+        "old_csv_files": old_csv_files,
+        "new_csv_files": new_csv_files,
+        "old_csv_map": old_csv_map,
+        "new_csv_map": new_csv_map,
+        "old_csv_collisions": old_csv_collisions,
+        "new_csv_collisions": new_csv_collisions,
+        "common_csv_keys": common_csv_keys,
+        "status_rows": status_rows,
+    }
+
+
+def build_summary_csv_bytes(status_rows):
+    if not status_rows:
+        return b""
+    return pd.DataFrame(status_rows).to_csv(index=False).encode("utf-8")
+
+
+def build_detailed_report_zip_bytes(pair_results, ignore_list):
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        summary_rows = []
+        for pair_result in pair_results:
+            summary_rows.extend(pair_result["status_rows"])
+
+        if summary_rows:
+            summary_csv = pd.DataFrame(summary_rows).to_csv(index=False)
+            archive.writestr("summary_report.csv", summary_csv)
+
+        for pair_result in pair_results:
+            pair_folder = sanitize_filename_part(pair_result["zip_pair_key"])
+
+            if pair_result["old_csv_collisions"] or pair_result["new_csv_collisions"]:
+                collision_lines = []
+                if pair_result["old_csv_collisions"]:
+                    collision_lines.append("Old-side CSV name collisions:")
+                    for key, values in sorted(pair_result["old_csv_collisions"].items()):
+                        collision_lines.append(f"{key}: {', '.join(values)}")
+                if pair_result["new_csv_collisions"]:
+                    collision_lines.append("New-side CSV name collisions:")
+                    for key, values in sorted(pair_result["new_csv_collisions"].items()):
+                        collision_lines.append(f"{key}: {', '.join(values)}")
+                archive.writestr(f"{pair_folder}/collision_notes.txt", "\n".join(collision_lines))
+
+            for csv_key in pair_result["common_csv_keys"]:
+                old_path = pair_result["old_csv_map"][csv_key]
+                new_path = pair_result["new_csv_map"][csv_key]
+                old_df = read_csv_from_zip(pair_result["old_zip"], old_path)
+                new_df = read_csv_from_zip(pair_result["new_zip"], new_path)
+                status, diff_df = compare_dataframes(old_df, new_df, ignore_list)
+                csv_stub = sanitize_filename_part(csv_key)
+
+                if status == "Data Mismatch" and diff_df is not None and not diff_df.empty:
+                    old_diff = diff_df[diff_df["_source"] == "OLD"].drop(columns=["_source"])
+                    new_diff = diff_df[diff_df["_source"] == "NEW"].drop(columns=["_source"])
+                    archive.writestr(
+                        f"{pair_folder}/{csv_stub}_old_differing_rows.csv",
+                        old_diff.to_csv(index=False),
+                    )
+                    archive.writestr(
+                        f"{pair_folder}/{csv_stub}_new_differing_rows.csv",
+                        new_diff.to_csv(index=False),
+                    )
+                elif status == "Schema Diff" and old_df is not None and new_df is not None:
+                    old_cols = pd.DataFrame({"old_columns": sorted(drop_ignored_columns(old_df, ignore_list).columns)})
+                    new_cols = pd.DataFrame({"new_columns": sorted(drop_ignored_columns(new_df, ignore_list).columns)})
+                    archive.writestr(
+                        f"{pair_folder}/{csv_stub}_old_columns.csv",
+                        old_cols.to_csv(index=False),
+                    )
+                    archive.writestr(
+                        f"{pair_folder}/{csv_stub}_new_columns.csv",
+                        new_cols.to_csv(index=False),
+                    )
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def format_pair_label(pair_result):
+    return f"{pair_result['zip_pair_key']} | {pair_result['old_zip_name']} vs {pair_result['new_zip_name']}"
 
 
 def show_local_download_panel():
@@ -275,11 +446,14 @@ with st.expander("how to use this app", expanded=True):
         1. choose the safest run mode for your data:
            - **cloud/community mode:** convenient, but uploaded ZIP/CSV content is processed on the server running this app.
            - **local mode:** preferred for confidential or sensitive CSVs; download the standalone script from the sidebar and run it on your own computer.
-        2. upload the **old/reference ZIP** and the **new/target ZIP** in the sidebar.
-        3. adjust the auto-match settings if filenames include prefixes or suffixes that should be ignored.
-        4. list columns to ignore, such as load timestamps or run IDs.
-        5. review the global status report, then inspect any mismatches in detail.
-        6. use **clear uploaded data** when finished to reset upload widgets and session state.
+        2. upload one or more **old/reference ZIPs** and the matching **new/target ZIPs** in the sidebar.
+        3. use the **ZIP auto-match logic** settings if old and new ZIP filenames need normalization before pairing.
+        4. use the **CSV auto-match logic** settings if filenames inside the ZIPs need normalization before pairing.
+        5. list columns to ignore, such as load timestamps, run IDs, or batch IDs.
+        6. review the **global status report** across all auto-paired ZIP sets.
+        7. download the summary CSV or full report ZIP if you want to share or archive the results.
+        8. inspect individual CSV comparisons in detail, or use manual ZIP/CSV pairing when needed.
+        9. use **clear uploaded data** when finished to reset upload widgets and session state.
 
         **privacy and security best practices**
         - use the local version for highly sensitive, regulated, client, financial, HR, or legal data.
@@ -323,111 +497,185 @@ with st.sidebar:
     st.divider()
     st.header("1. upload files")
     upload_version = st.session_state.get("upload_version", 0)
-    zip_ref = st.file_uploader("upload reference / old zip", type="zip", key=f"zip_ref_{upload_version}")
-    zip_target = st.file_uploader("upload target / new zip", type="zip", key=f"zip_target_{upload_version}")
+    old_zip_files = st.file_uploader(
+        "upload reference / old zip files",
+        type="zip",
+        accept_multiple_files=True,
+        key=f"old_zip_files_{upload_version}",
+    )
+    new_zip_files = st.file_uploader(
+        "upload target / new zip files",
+        type="zip",
+        accept_multiple_files=True,
+        key=f"new_zip_files_{upload_version}",
+    )
     st.divider()
-    st.header("2. auto-match logic")
-    ref_prefix = st.text_input("remove from old:", placeholder="e.g. kaplan-")
-    tgt_prefix = st.text_input("remove from new:", placeholder="e.g. newkaplan-")
-    suffix_sep = st.text_input("split character:", placeholder="e.g. _ or -")
+    st.header("2. ZIP auto-match logic")
+    old_zip_prefix = st.text_input("remove from old ZIP names:", placeholder="e.g. old-")
+    new_zip_prefix = st.text_input("remove from new ZIP names:", placeholder="e.g. new-")
+    zip_suffix_sep = st.text_input("ZIP split character:", placeholder="e.g. _ or -")
     st.divider()
-    st.header("3. ignore columns")
+    st.header("3. CSV auto-match logic")
+    old_csv_prefix = st.text_input("remove from old CSV names:", placeholder="e.g. kaplan-")
+    new_csv_prefix = st.text_input("remove from new CSV names:", placeholder="e.g. newkaplan-")
+    csv_suffix_sep = st.text_input("CSV split character:", placeholder="e.g. _ or -")
+    st.divider()
+    st.header("4. ignore columns")
     global_ignore_str = st.text_area("global ignore:", "LoadDate, Timestamp, RunID")
-    ignore_list = [x.strip() for x in global_ignore_str.split(",") if x.strip()]
+    ignore_list = [item.strip() for item in global_ignore_str.split(",") if item.strip()]
 
-if zip_ref and zip_target:
-    valid_ref, ref_message = validate_zip_upload(zip_ref, "old ZIP")
-    valid_target, target_message = validate_zip_upload(zip_target, "new ZIP")
+if old_zip_files and new_zip_files:
+    valid_old_zip_files, old_validation_errors = validate_uploaded_group(old_zip_files, "old ZIP")
+    valid_new_zip_files, new_validation_errors = validate_uploaded_group(new_zip_files, "new ZIP")
 
-    if not valid_ref or not valid_target:
-        if ref_message:
-            st.error(ref_message)
-        if target_message:
-            st.error(target_message)
+    if old_validation_errors or new_validation_errors:
+        for message in old_validation_errors + new_validation_errors:
+            st.error(message)
         st.stop()
 
-    ref_files_raw = get_file_list(zip_ref)
-    tgt_files_raw = get_file_list(zip_target)
-    ref_map, ref_collisions = build_normalized_map(ref_files_raw, ref_prefix, suffix_sep)
-    tgt_map, tgt_collisions = build_normalized_map(tgt_files_raw, tgt_prefix, suffix_sep)
-    common_keys = sorted(set(ref_map.keys()).intersection(set(tgt_map.keys())))
+    old_zip_map, old_zip_collisions = build_normalized_object_map(
+        valid_old_zip_files,
+        uploaded_name,
+        old_zip_prefix,
+        zip_suffix_sep,
+    )
+    new_zip_map, new_zip_collisions = build_normalized_object_map(
+        valid_new_zip_files,
+        uploaded_name,
+        new_zip_prefix,
+        zip_suffix_sep,
+    )
+    common_zip_keys = sorted(set(old_zip_map.keys()).intersection(set(new_zip_map.keys())))
+    unmatched_old_zip_keys = sorted(set(old_zip_map.keys()).difference(set(new_zip_map.keys())))
+    unmatched_new_zip_keys = sorted(set(new_zip_map.keys()).difference(set(old_zip_map.keys())))
 
-    if ref_collisions or tgt_collisions:
+    if old_zip_collisions or new_zip_collisions:
         st.warning(
-            "Some files collapse to the same normalized name and were excluded from auto-matching. "
-            "Use manual force-pairing for those cases."
+            "Some ZIP files collapse to the same normalized name and were excluded from auto-pairing. "
+            "Use manual ZIP/CSV pairing for those cases."
         )
-        if ref_collisions:
-            st.caption(f"old-side collisions: {', '.join(sorted(ref_collisions.keys()))}")
-        if tgt_collisions:
-            st.caption(f"new-side collisions: {', '.join(sorted(tgt_collisions.keys()))}")
+        if old_zip_collisions:
+            st.caption(f"old-side ZIP collisions: {', '.join(sorted(old_zip_collisions.keys()))}")
+        if new_zip_collisions:
+            st.caption(f"new-side ZIP collisions: {', '.join(sorted(new_zip_collisions.keys()))}")
 
-    st.divider()
-    st.subheader(f"global status report ({len(common_keys)} pairs)")
+    if unmatched_old_zip_keys or unmatched_new_zip_keys:
+        st.warning("Some ZIP files could not be auto-paired and were excluded from the batch report.")
+        if unmatched_old_zip_keys:
+            st.caption(f"unmatched old ZIP keys: {', '.join(unmatched_old_zip_keys)}")
+        if unmatched_new_zip_keys:
+            st.caption(f"unmatched new ZIP keys: {', '.join(unmatched_new_zip_keys)}")
 
-    if common_keys:
-        status_data = []
-        p_bar = st.progress(0)
-        for i, key in enumerate(common_keys):
-            d1 = read_csv_from_zip(zip_ref, ref_map[key])
-            d2 = read_csv_from_zip(zip_target, tgt_map[key])
-            status, diff_df = compare_dataframes(d1, d2, ignore_list)
-            status_data.append(
-                {
-                    "normalized name": key,
-                    "status": status,
-                    "rows old": d1.shape[0] if d1 is not None else 0,
-                    "rows new": d2.shape[0] if d2 is not None else 0,
-                    "diff rows": len(diff_df) if diff_df is not None else 0,
-                    "old file": ref_map[key],
-                    "new file": tgt_map[key],
-                }
+    pair_results = []
+    for zip_key in common_zip_keys:
+        pair_results.append(
+            analyze_zip_pair(
+                old_zip_map[zip_key],
+                new_zip_map[zip_key],
+                zip_key,
+                old_csv_prefix,
+                new_csv_prefix,
+                csv_suffix_sep,
+                ignore_list,
             )
-            p_bar.progress((i + 1) / len(common_keys))
-        p_bar.empty()
+        )
 
-        def color_status(value):
-            if "Match" in value:
-                return "background-color: #d4edda"
-            if "Error" in value:
-                return "background-color: #f8d7da"
-            return "background-color: #fff3cd"
+    all_status_rows = []
+    for pair_result in pair_results:
+        all_status_rows.extend(pair_result["status_rows"])
 
-        st.dataframe(pd.DataFrame(status_data).style.map(color_status, subset=["status"]), use_container_width=True)
+    total_csv_pairs = len(all_status_rows)
+    st.divider()
+    st.subheader(f"global status report ({total_csv_pairs} csv pairs across {len(pair_results)} zip pairs)")
+
+    if all_status_rows:
+        summary_df = pd.DataFrame(all_status_rows)
+        st.dataframe(summary_df.style.map(color_status, subset=["status"]), use_container_width=True)
+
+        summary_csv_bytes = build_summary_csv_bytes(all_status_rows)
+        detailed_report_zip_bytes = build_detailed_report_zip_bytes(pair_results, ignore_list)
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                label="download summary CSV",
+                data=summary_csv_bytes,
+                file_name="comparison_summary.csv",
+                mime="text/csv",
+            )
+        with d2:
+            st.download_button(
+                label="download detailed report ZIP",
+                data=detailed_report_zip_bytes,
+                file_name="comparison_report.zip",
+                mime="application/zip",
+            )
     else:
-        st.warning("No auto-matches found. Check settings or use manual pairing.")
+        st.warning("No auto-matched CSV pairs were found across the auto-paired ZIP sets.")
 
     st.divider()
     st.header("detailed inspection")
-    t_auto, t_manual = st.tabs(["auto-matched files", "manual force-pairing"])
+    t_auto, t_manual = st.tabs(["auto-matched zip pairs", "manual ZIP/CSV pairing"])
 
     with t_auto:
-        if common_keys:
-            selected_key = st.selectbox("select pair:", common_keys)
-            if st.button(f"compare: {selected_key}"):
-                d1 = read_csv_from_zip(zip_ref, ref_map[selected_key])
-                d2 = read_csv_from_zip(zip_target, tgt_map[selected_key])
-                display_diff_results(
-                    *compare_dataframes(d1, d2, ignore_list),
-                    d1.shape[0] if d1 is not None else 0,
-                    d2.shape[0] if d2 is not None else 0,
-                )
+        if pair_results:
+            pair_lookup = {pair_result["zip_pair_key"]: pair_result for pair_result in pair_results}
+            selected_pair_key = st.selectbox(
+                "select zip pair:",
+                common_zip_keys,
+                format_func=lambda key: format_pair_label(pair_lookup[key]),
+            )
+            selected_pair = pair_lookup[selected_pair_key]
+            st.caption(f"old ZIP: {selected_pair['old_zip_name']}")
+            st.caption(f"new ZIP: {selected_pair['new_zip_name']}")
+
+            if selected_pair["old_csv_collisions"] or selected_pair["new_csv_collisions"]:
+                st.info("This ZIP pair has CSV name collisions excluded from auto-matching.")
+
+            if selected_pair["common_csv_keys"]:
+                selected_csv_key = st.selectbox("select csv pair:", selected_pair["common_csv_keys"])
+                if st.button(f"compare: {selected_csv_key}"):
+                    old_df = read_csv_from_zip(selected_pair["old_zip"], selected_pair["old_csv_map"][selected_csv_key])
+                    new_df = read_csv_from_zip(selected_pair["new_zip"], selected_pair["new_csv_map"][selected_csv_key])
+                    display_diff_results(
+                        *compare_dataframes(old_df, new_df, ignore_list),
+                        old_df.shape[0] if old_df is not None else 0,
+                        new_df.shape[0] if new_df is not None else 0,
+                    )
+            else:
+                st.info("No CSV files were auto-matched inside this ZIP pair.")
+        else:
+            st.info("No ZIP pairs were auto-matched.")
 
     with t_manual:
-        if ref_files_raw and tgt_files_raw:
+        if valid_old_zip_files and valid_new_zip_files:
             c1, c2 = st.columns(2)
-            manual_ref = c1.selectbox("select old file:", ref_files_raw)
-            manual_target = c2.selectbox("select new file:", tgt_files_raw)
-            if st.button("compare selected files"):
-                d1 = read_csv_from_zip(zip_ref, manual_ref)
-                d2 = read_csv_from_zip(zip_target, manual_target)
-                display_diff_results(
-                    *compare_dataframes(d1, d2, ignore_list),
-                    d1.shape[0] if d1 is not None else 0,
-                    d2.shape[0] if d2 is not None else 0,
-                )
-        else:
-            st.info("Both ZIP files need at least one CSV for manual pairing.")
+            manual_old_zip = c1.selectbox(
+                "select old ZIP:",
+                valid_old_zip_files,
+                format_func=uploaded_name,
+            )
+            manual_new_zip = c2.selectbox(
+                "select new ZIP:",
+                valid_new_zip_files,
+                format_func=uploaded_name,
+            )
+            manual_old_csv_files = get_file_list(manual_old_zip)
+            manual_new_csv_files = get_file_list(manual_new_zip)
+
+            if manual_old_csv_files and manual_new_csv_files:
+                c3, c4 = st.columns(2)
+                manual_old_csv = c3.selectbox("select old CSV file:", manual_old_csv_files)
+                manual_new_csv = c4.selectbox("select new CSV file:", manual_new_csv_files)
+                if st.button("compare selected ZIP/CSV files"):
+                    old_df = read_csv_from_zip(manual_old_zip, manual_old_csv)
+                    new_df = read_csv_from_zip(manual_new_zip, manual_new_csv)
+                    display_diff_results(
+                        *compare_dataframes(old_df, new_df, ignore_list),
+                        old_df.shape[0] if old_df is not None else 0,
+                        new_df.shape[0] if new_df is not None else 0,
+                    )
+            else:
+                st.info("Both selected ZIP files need at least one CSV for manual pairing.")
 else:
     show_local_download_panel()
-    st.info("Please upload ZIP files to start, or download the local script to run privately on your computer.")
+    st.info("Please upload old/reference ZIP files and new/target ZIP files to start, or download the local script to run privately on your computer.")

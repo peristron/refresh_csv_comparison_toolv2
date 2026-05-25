@@ -573,9 +573,9 @@ with st.sidebar:
             **run locally**
 
             1. download the script.
-            2. if the filename includes extra numbers or parentheses such as `(1)` or `(2)`, rename it to `local_csv_tool.py`.
+            2. if the filename includes extra numbers or parentheses such as `(1)` or `(2)`, rename it to `local_csv_tool.py` (or just remove the parantheses and keep that number).
             3. open a terminal in the folder containing the file.
-            4. run `streamlit run local_csv_tool.py`
+            4. run `streamlit run local_csv_tool.py`, or `local_csv_tool3.py` if you removed the parantheses around the file copy number that windows adds when you have multiple files with the same name
             """
         )
     st.divider()

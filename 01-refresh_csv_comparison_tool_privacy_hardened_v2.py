@@ -570,12 +570,12 @@ with st.sidebar:
         )
         st.markdown(
             """
-            **Run locally**
+            **run locally**
 
-            1. Download the script.
-            2. If the filename includes extra numbers or parentheses such as `(1)` or `(2)`, rename it to `local_csv_tool.py`.
-            3. Open a terminal in the folder containing the file.
-            4. Run `streamlit run local_csv_tool.py`
+            1. download the script.
+            2. if the filename includes extra numbers or parentheses such as `(1)` or `(2)`, rename it to `local_csv_tool.py`.
+            3. open a terminal in the folder containing the file.
+            4. run `streamlit run local_csv_tool.py`
             """
         )
     st.divider()

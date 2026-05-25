@@ -555,6 +555,7 @@ with st.expander("privacy note", expanded=False):
         """
     )
 
+#>>>>>>>>>>>>>>>>
 with st.sidebar:
     st.title("csv tool")
     with st.expander("run locally", expanded=True):
@@ -567,9 +568,18 @@ with st.sidebar:
             key="sidebar_local_download",
             disabled=not LOCAL_SCRIPT_CONTENT,
         )
-        st.markdown("`pip install streamlit pandas`")
-        st.markdown("`streamlit run local_csv_tool.py`")
+        st.markdown(
+            """
+            **Run locally**
+
+            1. Download the script.
+            2. If the filename includes extra numbers or parentheses such as `(1)` or `(2)`, rename it to `local_csv_tool.py`.
+            3. Open a terminal in the folder containing the file.
+            4. Run `streamlit run local_csv_tool.py`
+            """
+        )
     st.divider()
+#<<<<<<<<<<<<<<<<
 
 if not check_password():
     st.stop()

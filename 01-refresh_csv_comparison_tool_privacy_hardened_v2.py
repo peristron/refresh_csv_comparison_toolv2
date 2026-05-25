@@ -502,8 +502,22 @@ def show_local_download_panel():
         mime="text/x-python",
         disabled=not LOCAL_SCRIPT_CONTENT,
     )
-    st.code("pip install streamlit pandas\nstreamlit run local_csv_tool.py", language="bash")
+#>>>>>>>>>>>>>>>>
+    st.markdown(
+        """
+        **How to run locally**
 
+        1. Download the standalone script.
+        2. If your browser saves it with extra numbers or parentheses such as `(1)` or `(2)`, rename it to `local_csv_tool.py`.
+        3. Open a terminal in the folder containing the file.
+        4. Run:
+
+        ```bash
+        streamlit run local_csv_tool.py
+        ```
+        """
+    )
+#<<<<<<<<<<<<<<<<
 
 st.title("refresh csv comparison tool")
 

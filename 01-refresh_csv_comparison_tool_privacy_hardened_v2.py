@@ -479,7 +479,7 @@ def display_diff_results(status, diff_df, rows_old, rows_new, row_by_row_changes
         st.warning(f"Found {diff_count} differing row instance(s).")
         old_diff = diff_df[diff_df["_source"] == "OLD"].drop(columns=["_source"])
         new_diff = diff_df[diff_df["_source"] == "NEW"].drop(columns=["_source"])
-        st.subheader("simple change view")
+        st.subheader("changed cells")
         if row_by_row_changes is not None and not row_by_row_changes.empty:
             st.caption("Changed cells by original CSV row number, similar to a side-by-side text comparison.")
             st.dataframe(row_by_row_changes, use_container_width=True, hide_index=True)

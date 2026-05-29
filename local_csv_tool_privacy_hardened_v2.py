@@ -209,6 +209,23 @@ def drop_ignored_columns(df, ignore_cols):
     return df.drop(columns=[c for c in ignore_cols if c in df.columns], errors="ignore").copy()
 
 
+def make_comparable_dataframe(df):
+    comparable_df = df.sort_index(axis=1).copy()
+    for column in comparable_df.columns:
+        comparable_df[column] = comparable_df[column].astype("string").fillna("<blank>")
+    return comparable_df
+
+
+def build_row_count_diff(row_count_old, row_count_new):
+    note = "all comparable columns were ignored; only row counts can be compared"
+    removed_count = max(row_count_old - row_count_new, 0)
+    added_count = max(row_count_new - row_count_old, 0)
+    diff_rows = []
+    diff_rows.extend([{"comparison note": note, "_source": "OLD"} for _ in range(removed_count)])
+    diff_rows.extend([{"comparison note": note, "_source": "NEW"} for _ in range(added_count)])
+    return pd.DataFrame(diff_rows)
+
+
 def read_csv_from_zip(zip_file, full_path):
     try:
         zip_file.seek(0)
@@ -240,8 +257,13 @@ def compare_dataframes(df1, df2, ignore_cols):
     if set(df1.columns) != set(df2.columns):
         return "Schema Diff", None
 
-    df1 = df1.sort_index(axis=1)
-    df2 = df2.sort_index(axis=1)
+    if len(df1.columns) == 0:
+        if len(df1) == len(df2):
+            return "Match", pd.DataFrame()
+        return "Data Mismatch", build_row_count_diff(len(df1), len(df2))
+
+    df1 = make_comparable_dataframe(df1)
+    df2 = make_comparable_dataframe(df2)
     compare_cols = list(df1.columns)
 
     old_counts = df1.value_counts(dropna=False).rename("old_count").reset_index()
@@ -265,6 +287,104 @@ def compare_dataframes(df1, df2, ignore_cols):
     return "Data Mismatch", pd.DataFrame(diff_rows)
 
 
+def build_row_by_row_change_table(old_df, new_df, ignore_cols):
+    if old_df is None or new_df is None:
+        return pd.DataFrame()
+
+    old_df = drop_ignored_columns(old_df, ignore_cols)
+    new_df = drop_ignored_columns(new_df, ignore_cols)
+    columns = sorted(set(old_df.columns).union(set(new_df.columns)))
+    max_rows = max(len(old_df), len(new_df))
+    change_rows = []
+
+    for row_index in range(max_rows):
+        has_old = row_index < len(old_df)
+        has_new = row_index < len(new_df)
+
+        for column in columns:
+            old_has_column = column in old_df.columns
+            new_has_column = column in new_df.columns
+            old_value = old_df.iloc[row_index][column] if has_old and old_has_column else ""
+            new_value = new_df.iloc[row_index][column] if has_new and new_has_column else ""
+
+            if pd.isna(old_value):
+                old_value = ""
+            if pd.isna(new_value):
+                new_value = ""
+
+            if str(old_value) == str(new_value):
+                continue
+
+            change_rows.append(
+                {
+                    "row #": row_index + 1,
+                    "column": column,
+                    "old value": old_value,
+                    "new value": new_value,
+                }
+            )
+
+    return pd.DataFrame(change_rows)
+
+
+def build_simple_change_table(old_diff, new_diff):
+    columns = list(old_diff.columns.union(new_diff.columns, sort=False))
+    old_aligned = old_diff.reindex(columns=columns).reset_index(drop=True)
+    new_aligned = new_diff.reindex(columns=columns).reset_index(drop=True)
+    max_rows = max(len(old_aligned), len(new_aligned))
+    change_rows = []
+
+    for row_index in range(max_rows):
+        has_old = row_index < len(old_aligned)
+        has_new = row_index < len(new_aligned)
+        old_row = old_aligned.iloc[row_index] if has_old else pd.Series(dtype="object")
+        new_row = new_aligned.iloc[row_index] if has_new else pd.Series(dtype="object")
+
+        if has_old and has_new:
+            change_type = "changed or rebalanced row"
+        elif has_old:
+            change_type = "only in old file"
+        else:
+            change_type = "only in new file"
+
+        row_had_visible_change = False
+        for column in columns:
+            old_value = old_row.get(column, "") if has_old else ""
+            new_value = new_row.get(column, "") if has_new else ""
+
+            if pd.isna(old_value):
+                old_value = ""
+            if pd.isna(new_value):
+                new_value = ""
+
+            if has_old and has_new and str(old_value) == str(new_value):
+                continue
+
+            row_had_visible_change = True
+            change_rows.append(
+                {
+                    "change #": row_index + 1,
+                    "change type": change_type,
+                    "column": column,
+                    "old value": old_value,
+                    "new value": new_value,
+                }
+            )
+
+        if not row_had_visible_change:
+            change_rows.append(
+                {
+                    "change #": row_index + 1,
+                    "change type": change_type,
+                    "column": "full row",
+                    "old value": "duplicate count changed",
+                    "new value": "duplicate count changed",
+                }
+            )
+
+    return pd.DataFrame(change_rows)
+
+
 def color_status(value):
     if "Match" in value:
         return "background-color: #d4edda"
@@ -273,7 +393,7 @@ def color_status(value):
     return "background-color: #fff3cd"
 
 
-def display_diff_results(status, diff_df, rows_old, rows_new):
+def display_diff_results(status, diff_df, rows_old, rows_new, row_by_row_changes=None):
     m1, m2, m3 = st.columns(3)
     m1.metric("rows in old file", rows_old)
     m2.metric("rows in new file", rows_new, delta=(rows_new - rows_old))
@@ -290,6 +410,14 @@ def display_diff_results(status, diff_df, rows_old, rows_new):
         st.warning(f"Found {diff_count} differing row instance(s).")
         old_diff = diff_df[diff_df["_source"] == "OLD"].drop(columns=["_source"])
         new_diff = diff_df[diff_df["_source"] == "NEW"].drop(columns=["_source"])
+        st.subheader("simple change view")
+        if row_by_row_changes is not None and not row_by_row_changes.empty:
+            st.caption("Changed cells by original CSV row number, similar to a side-by-side text comparison.")
+            st.dataframe(row_by_row_changes, use_container_width=True, hide_index=True)
+        else:
+            simple_change_table = build_simple_change_table(old_diff, new_diff)
+            st.caption("Changed row instances after treating the CSV as an unordered set of rows.")
+            st.dataframe(simple_change_table, use_container_width=True, hide_index=True)
         t1, t2 = st.tabs([f"old differing rows ({len(old_diff)})", f"new differing rows ({len(new_diff)})"])
         with t1:
             st.dataframe(old_diff, use_container_width=True)
@@ -629,6 +757,7 @@ if old_zip_files and new_zip_files:
                         *compare_dataframes(old_df, new_df, ignore_list),
                         old_df.shape[0] if old_df is not None else 0,
                         new_df.shape[0] if new_df is not None else 0,
+                        build_row_by_row_change_table(old_df, new_df, ignore_list),
                     )
             else:
                 st.info("No CSV files were auto-matched inside this ZIP pair.")
@@ -662,6 +791,7 @@ if old_zip_files and new_zip_files:
                         *compare_dataframes(old_df, new_df, ignore_list),
                         old_df.shape[0] if old_df is not None else 0,
                         new_df.shape[0] if new_df is not None else 0,
+                        build_row_by_row_change_table(old_df, new_df, ignore_list),
                     )
             else:
                 st.info("Both selected ZIP files need at least one CSV for manual pairing.")

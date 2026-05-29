@@ -138,6 +138,10 @@ def strip_role_suffix_tokens(normalized_name, role):
     return stripped_name or normalized_name
 
 
+def strip_leading_date_token(normalized_name):
+    return re.sub(r"^\d{8}[_\-\s]+", "", normalized_name)
+
+
 def build_normalized_object_map(objects, name_getter, prefix="", suffix_delimiter=""):
     object_map = {}
     collisions = {}
@@ -181,15 +185,39 @@ def build_zip_pair_maps(old_zip_files, new_zip_files, old_zip_prefix, new_zip_pr
 
     old_zip_map, old_zip_collisions = build_normalized_object_map(
         old_zip_files,
+        lambda item: strip_leading_date_token(
+            normalize_filename(uploaded_name(item), old_zip_prefix, zip_suffix_sep)
+        ),
+    )
+    new_zip_map, new_zip_collisions = build_normalized_object_map(
+        new_zip_files,
+        lambda item: strip_leading_date_token(
+            normalize_filename(uploaded_name(item), new_zip_prefix, zip_suffix_sep)
+        ),
+    )
+    common_zip_keys = sorted(set(old_zip_map.keys()).intersection(set(new_zip_map.keys())))
+
+    if common_zip_keys:
+        return {
+            "old_zip_map": old_zip_map,
+            "new_zip_map": new_zip_map,
+            "old_zip_collisions": old_zip_collisions,
+            "new_zip_collisions": new_zip_collisions,
+            "common_zip_keys": common_zip_keys,
+            "match_mode": "date_prefix_fallback",
+        }
+
+    old_zip_map, old_zip_collisions = build_normalized_object_map(
+        old_zip_files,
         lambda item: strip_role_suffix_tokens(
-            normalize_filename(uploaded_name(item), old_zip_prefix, zip_suffix_sep),
+            strip_leading_date_token(normalize_filename(uploaded_name(item), old_zip_prefix, zip_suffix_sep)),
             "old",
         ),
     )
     new_zip_map, new_zip_collisions = build_normalized_object_map(
         new_zip_files,
         lambda item: strip_role_suffix_tokens(
-            normalize_filename(uploaded_name(item), new_zip_prefix, zip_suffix_sep),
+            strip_leading_date_token(normalize_filename(uploaded_name(item), new_zip_prefix, zip_suffix_sep)),
             "new",
         ),
     )
@@ -655,9 +683,11 @@ if old_zip_files and new_zip_files:
     unmatched_old_zip_keys = sorted(set(old_zip_map.keys()).difference(set(new_zip_map.keys())))
     unmatched_new_zip_keys = sorted(set(new_zip_map.keys()).difference(set(old_zip_map.keys())))
 
-    if zip_pairing["match_mode"] == "role_suffix_fallback":
+    if zip_pairing["match_mode"] == "date_prefix_fallback":
+        st.info("ZIP pairs were matched after removing leading backup dates such as `20260519-` and `20260529-`.")
+    elif zip_pairing["match_mode"] == "role_suffix_fallback":
         st.info(
-            "ZIP pairs were matched using fallback role-word stripping for trailing names such as "
+            "ZIP pairs were matched using fallback cleanup for leading backup dates and trailing role words such as "
             "`old`/`reference` and `new`/`target`."
         )
 
@@ -679,8 +709,8 @@ if old_zip_files and new_zip_files:
             st.caption(f"unmatched new ZIP keys: {', '.join(unmatched_new_zip_keys)}")
         if zip_pairing["match_mode"] == "none":
             st.caption(
-                "Tip: if your ZIP names end with phrases like `_old_reference` and `_new_target`, "
-                "either remove those suffixes in ZIP auto-match logic or rely on the fallback role-word pairing."
+                "Tip: if your ZIP names start with different backup dates or end with phrases like "
+                "`_old_reference` and `_new_target`, either use the ZIP auto-match fields or rely on fallback cleanup."
             )
 
     pair_results = []

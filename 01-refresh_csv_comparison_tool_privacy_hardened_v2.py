@@ -1103,7 +1103,7 @@ def show_local_download_panel():
 
 st.title("refresh csv comparison tool")
 
-with st.expander("how to use this app", expanded=True):
+with st.expander("how to use this app", expanded=False):
     st.markdown(
         """
         1. choose the safest run mode for your data:

@@ -1130,7 +1130,7 @@ with st.sidebar:
     csv_suffix_sep = st.text_input("CSV split character:", placeholder="e.g. _ or -")
     st.divider()
     st.header("4. ignore columns")
-    global_ignore_str = st.text_area("global ignore:", "LoadDate, Timestamp, RunID")
+    global_ignore_str = st.text_area("global ignore:", "LoadDate, Timestamp, RunID, LastModified"")
     ignore_list = [item.strip() for item in global_ignore_str.split(",") if item.strip()]
 
 if old_zip_files and new_zip_files:

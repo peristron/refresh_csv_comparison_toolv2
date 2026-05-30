@@ -27,7 +27,33 @@ KEY_COLUMN_CANDIDATES = [
     ["OrgUnitId", "ConfigId"],
     ["ConfigId", "Name"],
     ["ConfigId"],
+    ["Orgid", "toolid"],
+    ["OrgId", "ToolId"],
+    ["OrgID", "ToolID"],
+    ["OrgUnitId", "ToolId"],
+    ["OwnerOrgUnitId", "CustomLinkId"],
+    ["OrgUnitId", "CustomLinkId"],
+    ["CustomLinkId"],
+    ["ToolId"],
+    ["toolid"],
+    ["Id"],
+    ["ID"],
 ]
+
+IDENTITY_COLUMN_HINTS = (
+    "id",
+    "key",
+    "guid",
+    "uuid",
+    "name",
+    "code",
+    "number",
+    "toolid",
+    "customlinkid",
+    "orgunitid",
+    "orgid",
+)
+MIN_KEY_OVERLAP_RATIO = 0.20
 
 
 def mb_to_bytes(value):
@@ -372,37 +398,172 @@ def get_display_value(row, column):
 def normalize_key_value(value):
     if pd.isna(value):
         return "<blank>"
-    return str(value)
+    return str(value).strip()
 
 
 def make_key_tuple(row, key_columns):
     return tuple(normalize_key_value(row[column]) for column in key_columns)
 
 
-def find_unique_key_columns(old_df, new_df):
-    for key_columns in KEY_COLUMN_CANDIDATES:
-        if not set(key_columns).issubset(old_df.columns) or not set(key_columns).issubset(new_df.columns):
+def resolve_column_names(columns, requested_columns):
+    exact_columns = set(columns)
+    lower_to_column = {column.lower(): column for column in columns}
+    resolved = []
+    missing = []
+    for requested in requested_columns:
+        requested = str(requested).strip()
+        if not requested:
             continue
+        if requested in exact_columns:
+            resolved.append(requested)
+        elif requested.lower() in lower_to_column:
+            resolved.append(lower_to_column[requested.lower()])
+        else:
+            missing.append(requested)
+    return resolved, missing
 
-        old_keys = old_df.apply(lambda row: make_key_tuple(row, key_columns), axis=1)
-        new_keys = new_df.apply(lambda row: make_key_tuple(row, key_columns), axis=1)
-        if old_keys.is_unique and new_keys.is_unique:
+
+def parse_key_columns_text(value):
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def is_identity_like(column):
+    lowered = column.lower().replace("_", "")
+    return any(hint in lowered for hint in IDENTITY_COLUMN_HINTS)
+
+
+def key_stats(old_df, new_df, key_columns):
+    if not key_columns:
+        return {
+            "old_unique": False,
+            "new_unique": False,
+            "old_count": 0,
+            "new_count": 0,
+            "overlap_count": 0,
+            "overlap_ratio": 0,
+        }
+    old_keys = old_df.apply(lambda row: make_key_tuple(row, key_columns), axis=1)
+    new_keys = new_df.apply(lambda row: make_key_tuple(row, key_columns), axis=1)
+    old_set = set(old_keys)
+    new_set = set(new_keys)
+    overlap_count = len(old_set.intersection(new_set))
+    smaller_side = max(min(len(old_set), len(new_set)), 1)
+    return {
+        "old_unique": old_keys.is_unique,
+        "new_unique": new_keys.is_unique,
+        "old_count": len(old_set),
+        "new_count": len(new_set),
+        "overlap_count": overlap_count,
+        "overlap_ratio": overlap_count / smaller_side,
+    }
+
+
+def validate_key_columns(old_df, new_df, key_columns):
+    common_columns = set(old_df.columns).intersection(set(new_df.columns))
+    missing = [column for column in key_columns if column not in common_columns]
+    if missing:
+        return False, f"These key columns are not present on both sides: {', '.join(missing)}"
+    stats = key_stats(old_df, new_df, key_columns)
+    if not stats["old_unique"] or not stats["new_unique"]:
+        return False, "The selected key does not uniquely identify rows on both sides."
+    if stats["overlap_ratio"] < MIN_KEY_OVERLAP_RATIO:
+        return False, (
+            "The selected key has very little overlap between old and new files "
+            f"({stats['overlap_count']} matching key(s))."
+        )
+    return True, ""
+
+
+def key_candidate_variants(old_df, new_df):
+    common_columns = [column for column in old_df.columns if column in new_df.columns]
+    lower_to_column = {column.lower(): column for column in common_columns}
+    seen = set()
+
+    for candidate in KEY_COLUMN_CANDIDATES:
+        resolved, missing = resolve_column_names(common_columns, candidate)
+        if missing or not resolved:
+            continue
+        key = tuple(resolved)
+        if key not in seen:
+            seen.add(key)
+            yield list(key)
+
+    identity_columns = [column for column in common_columns if is_identity_like(column)]
+
+    for column in identity_columns:
+        key = (column,)
+        if key not in seen:
+            seen.add(key)
+            yield list(key)
+
+    anchor_columns = [
+        column for column in identity_columns
+        if column.lower().replace("_", "") in {"orgid", "orgunitid", "ownerorgunitid"}
+    ]
+    other_columns = [column for column in identity_columns if column not in anchor_columns]
+    for anchor in anchor_columns:
+        for other in other_columns:
+            key = (anchor, other)
+            if key not in seen:
+                seen.add(key)
+                yield list(key)
+
+
+def find_unique_key_columns(old_df, new_df):
+    common_columns = [column for column in old_df.columns if column in new_df.columns]
+
+    # First use curated keys in priority order. These are deliberately more specific
+    # than a shortest-unique-key search, so the UI can explain the comparison with
+    # useful domain context such as Orgid + toolid or OrgUnitId + ConfigId + Name.
+    for candidate in KEY_COLUMN_CANDIDATES:
+        key_columns, missing = resolve_column_names(common_columns, candidate)
+        if missing or not key_columns:
+            continue
+        is_valid, _ = validate_key_columns(old_df, new_df, key_columns)
+        if is_valid:
             return key_columns
 
-    return []
+    best_candidate = []
+    best_score = (-1, -1, -1)
+    for key_columns in key_candidate_variants(old_df, new_df):
+        is_valid, _ = validate_key_columns(old_df, new_df, key_columns)
+        if not is_valid:
+            continue
+        stats = key_stats(old_df, new_df, key_columns)
+        overlap_ratio = stats["overlap_ratio"]
+        overlap_count = stats["overlap_count"]
+        # Prefer high overlap, then fewer key columns, for generic fallback keys.
+        score = (overlap_ratio, overlap_count, -len(key_columns))
+        if score > best_score:
+            best_score = score
+            best_candidate = key_columns
+
+    return best_candidate
 
 
 def key_label(key_columns, key_values):
     return " | ".join(f"{column}={value}" for column, value in zip(key_columns, key_values))
 
 
-def build_keyed_change_tables(old_df, new_df, ignore_cols):
+def build_keyed_change_tables(old_df, new_df, ignore_cols, key_columns_override=None):
     if old_df is None or new_df is None:
         return None
 
     old_df = drop_ignored_columns(old_df, ignore_cols).reset_index(drop=True)
     new_df = drop_ignored_columns(new_df, ignore_cols).reset_index(drop=True)
-    key_columns = find_unique_key_columns(old_df, new_df)
+    key_source = "manual" if key_columns_override else "inferred"
+
+    if key_columns_override:
+        common_columns = [column for column in old_df.columns if column in new_df.columns]
+        key_columns, missing_columns = resolve_column_names(common_columns, key_columns_override)
+        if missing_columns:
+            return {"key_error": f"Could not find key column(s): {', '.join(missing_columns)}"}
+        is_valid, message = validate_key_columns(old_df, new_df, key_columns)
+        if not is_valid:
+            return {"key_error": message, "key_columns": key_columns}
+    else:
+        key_columns = find_unique_key_columns(old_df, new_df)
+
     if not key_columns:
         return None
 
@@ -456,6 +617,7 @@ def build_keyed_change_tables(old_df, new_df, ignore_cols):
 
     return {
         "key_columns": key_columns,
+        "key_source": key_source,
         "changed_cells": pd.DataFrame(changed_rows),
         "removed_rows": pd.DataFrame(removed_rows),
         "added_rows": pd.DataFrame(added_rows),
@@ -560,6 +722,70 @@ def build_simple_change_table(old_diff, new_diff):
     return pd.DataFrame(change_rows)
 
 
+def key_options_for_display(old_df, new_df, ignore_cols):
+    if old_df is None or new_df is None:
+        return [], []
+    old_clean = drop_ignored_columns(old_df, ignore_cols)
+    new_clean = drop_ignored_columns(new_df, ignore_cols)
+    options = [column for column in old_clean.columns if column in new_clean.columns]
+    inferred = find_unique_key_columns(old_clean, new_clean)
+    return options, inferred
+
+
+def render_key_controls(old_df, new_df, ignore_cols, widget_key):
+    options, inferred = key_options_for_display(old_df, new_df, ignore_cols)
+    if not options:
+        return []
+
+    selected_columns = []
+    with st.expander("comparison key override", expanded=False):
+        if inferred:
+            st.caption(f"auto-inferred key: {', '.join(inferred)}")
+        else:
+            st.caption("No stable key was auto-inferred. Choose columns that uniquely identify one logical row.")
+
+        selected_columns = st.multiselect(
+            "key columns to match rows before showing changed/removed/added rows:",
+            options,
+            default=inferred,
+            key=f"{widget_key}_key_columns",
+        )
+        typed_columns = st.text_input(
+            "or type key columns, comma-separated:",
+            placeholder="e.g. Orgid, toolid",
+            key=f"{widget_key}_typed_key_columns",
+        )
+        if typed_columns.strip():
+            selected_columns = parse_key_columns_text(typed_columns)
+
+        st.caption(
+            "Tip: choose columns that identify the same record in both files. "
+            "Examples: Orgid + toolid, OrgUnitId + ConfigId + Name, or OwnerOrgUnitId + CustomLinkId."
+        )
+
+        if selected_columns:
+            old_clean = drop_ignored_columns(old_df, ignore_cols)
+            new_clean = drop_ignored_columns(new_df, ignore_cols)
+            resolved, missing = resolve_column_names([column for column in old_clean.columns if column in new_clean.columns], selected_columns)
+            if missing:
+                st.warning(f"Missing key column(s): {', '.join(missing)}")
+            else:
+                stats = key_stats(old_clean, new_clean, resolved)
+                st.caption(
+                    f"key check: old unique={stats['old_unique']}, new unique={stats['new_unique']}, "
+                    f"matching keys={stats['overlap_count']}"
+                )
+
+    return selected_columns
+
+
+def build_change_details(old_df, new_df, ignore_cols, key_columns_override=None):
+    keyed_details = build_keyed_change_tables(old_df, new_df, ignore_cols, key_columns_override)
+    if isinstance(keyed_details, dict) and keyed_details.get("key_error"):
+        return keyed_details
+    return keyed_details or build_row_by_row_change_table(old_df, new_df, ignore_cols)
+
+
 def color_status(value):
     if "Match" in value:
         return "background-color: #d4edda"
@@ -585,13 +811,19 @@ def display_diff_results(status, diff_df, rows_old, rows_new, change_details=Non
         st.warning(f"Found {diff_count} differing row instance(s).")
         old_diff = diff_df[diff_df["_source"] == "OLD"].drop(columns=["_source"])
         new_diff = diff_df[diff_df["_source"] == "NEW"].drop(columns=["_source"])
-        st.subheader("changed cells")
+        if isinstance(change_details, dict) and change_details.get("key_error"):
+            st.subheader("changed cells")
+            st.warning(f"Keyed comparison could not be used: {change_details['key_error']}")
+            change_details = None
+
         if isinstance(change_details, dict) and change_details.get("key_columns"):
+            st.subheader("keyed difference view")
             key_columns = ", ".join(change_details["key_columns"])
             changed_cells = change_details["changed_cells"]
             removed_rows = change_details["removed_rows"]
             added_rows = change_details["added_rows"]
-            st.caption(f"Compared rows by stable key columns: {key_columns}.")
+            key_source = change_details.get("key_source", "inferred")
+            st.caption(f"Compared rows by stable key columns: {key_columns} ({key_source}).")
             k1, k2, k3 = st.columns(3)
             k1.metric("changed cells", len(changed_cells))
             k2.metric("removed rows", len(removed_rows))
@@ -608,9 +840,11 @@ def display_diff_results(status, diff_df, rows_old, rows_new, change_details=Non
             with keyed_tabs[2]:
                 st.dataframe(added_rows, use_container_width=True, hide_index=True)
         elif isinstance(change_details, pd.DataFrame) and not change_details.empty:
+            st.subheader("changed cells")
             st.caption("Changed cells by original CSV row number. This is best only when row order has not shifted.")
             st.dataframe(change_details, use_container_width=True, hide_index=True)
         else:
+            st.subheader("changed row instances")
             simple_change_table = build_simple_change_table(old_diff, new_diff)
             st.caption("Changed row instances after treating the CSV as an unordered set of rows.")
             st.dataframe(simple_change_table, use_container_width=True, hide_index=True)
@@ -896,7 +1130,7 @@ with st.sidebar:
     csv_suffix_sep = st.text_input("CSV split character:", placeholder="e.g. _ or -")
     st.divider()
     st.header("4. ignore columns")
-    global_ignore_str = st.text_area("global ignore:", "LoadDate, Timestamp, RunID, LastModified")
+    global_ignore_str = st.text_area("global ignore:", "LoadDate, Timestamp, RunID")
     ignore_list = [item.strip() for item in global_ignore_str.split(",") if item.strip()]
 
 if old_zip_files and new_zip_files:
@@ -1020,15 +1254,20 @@ if old_zip_files and new_zip_files:
 
             if selected_pair["common_csv_keys"]:
                 selected_csv_key = st.selectbox("select csv pair:", selected_pair["common_csv_keys"])
+                old_df = read_csv_from_zip(selected_pair["old_zip"], selected_pair["old_csv_map"][selected_csv_key])
+                new_df = read_csv_from_zip(selected_pair["new_zip"], selected_pair["new_csv_map"][selected_csv_key])
+                key_columns_override = render_key_controls(
+                    old_df,
+                    new_df,
+                    ignore_list,
+                    f"auto_{selected_pair_key}_{selected_csv_key}",
+                )
                 if st.button(f"compare: {selected_csv_key}"):
-                    old_df = read_csv_from_zip(selected_pair["old_zip"], selected_pair["old_csv_map"][selected_csv_key])
-                    new_df = read_csv_from_zip(selected_pair["new_zip"], selected_pair["new_csv_map"][selected_csv_key])
                     display_diff_results(
                         *compare_dataframes(old_df, new_df, ignore_list),
                         old_df.shape[0] if old_df is not None else 0,
                         new_df.shape[0] if new_df is not None else 0,
-                        build_keyed_change_tables(old_df, new_df, ignore_list)
-                        or build_row_by_row_change_table(old_df, new_df, ignore_list),
+                        build_change_details(old_df, new_df, ignore_list, key_columns_override),
                     )
             else:
                 st.info("No CSV files were auto-matched inside this ZIP pair.")
@@ -1055,15 +1294,20 @@ if old_zip_files and new_zip_files:
                 c3, c4 = st.columns(2)
                 manual_old_csv = c3.selectbox("select old CSV file:", manual_old_csv_files)
                 manual_new_csv = c4.selectbox("select new CSV file:", manual_new_csv_files)
+                old_df = read_csv_from_zip(manual_old_zip, manual_old_csv)
+                new_df = read_csv_from_zip(manual_new_zip, manual_new_csv)
+                key_columns_override = render_key_controls(
+                    old_df,
+                    new_df,
+                    ignore_list,
+                    f"manual_{uploaded_name(manual_old_zip)}_{uploaded_name(manual_new_zip)}_{manual_old_csv}_{manual_new_csv}",
+                )
                 if st.button("compare selected ZIP/CSV files"):
-                    old_df = read_csv_from_zip(manual_old_zip, manual_old_csv)
-                    new_df = read_csv_from_zip(manual_new_zip, manual_new_csv)
                     display_diff_results(
                         *compare_dataframes(old_df, new_df, ignore_list),
                         old_df.shape[0] if old_df is not None else 0,
                         new_df.shape[0] if new_df is not None else 0,
-                        build_keyed_change_tables(old_df, new_df, ignore_list)
-                        or build_row_by_row_change_table(old_df, new_df, ignore_list),
+                        build_change_details(old_df, new_df, ignore_list, key_columns_override),
                     )
             else:
                 st.info("Both selected ZIP files need at least one CSV for manual pairing.")

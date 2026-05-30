@@ -22,6 +22,12 @@ MAX_CSV_COUNT = 500
 MAX_COMPRESSION_RATIO = 100
 OLD_ROLE_SUFFIX_TOKENS = {"old", "reference", "ref", "before", "previous", "baseline"}
 NEW_ROLE_SUFFIX_TOKENS = {"new", "target", "after", "updated", "current"}
+KEY_COLUMN_CANDIDATES = [
+    ["OrgUnitId", "ConfigId", "Name"],
+    ["OrgUnitId", "ConfigId"],
+    ["ConfigId", "Name"],
+    ["ConfigId"],
+]
 
 
 def mb_to_bytes(value):
@@ -356,6 +362,106 @@ def compare_dataframes(df1, df2, ignore_cols):
     return "Data Mismatch", pd.DataFrame(diff_rows)
 
 
+def get_display_value(row, column):
+    value = row.get(column, "")
+    if pd.isna(value):
+        return ""
+    return value
+
+
+def normalize_key_value(value):
+    if pd.isna(value):
+        return "<blank>"
+    return str(value)
+
+
+def make_key_tuple(row, key_columns):
+    return tuple(normalize_key_value(row[column]) for column in key_columns)
+
+
+def find_unique_key_columns(old_df, new_df):
+    for key_columns in KEY_COLUMN_CANDIDATES:
+        if not set(key_columns).issubset(old_df.columns) or not set(key_columns).issubset(new_df.columns):
+            continue
+
+        old_keys = old_df.apply(lambda row: make_key_tuple(row, key_columns), axis=1)
+        new_keys = new_df.apply(lambda row: make_key_tuple(row, key_columns), axis=1)
+        if old_keys.is_unique and new_keys.is_unique:
+            return key_columns
+
+    return []
+
+
+def key_label(key_columns, key_values):
+    return " | ".join(f"{column}={value}" for column, value in zip(key_columns, key_values))
+
+
+def build_keyed_change_tables(old_df, new_df, ignore_cols):
+    if old_df is None or new_df is None:
+        return None
+
+    old_df = drop_ignored_columns(old_df, ignore_cols).reset_index(drop=True)
+    new_df = drop_ignored_columns(new_df, ignore_cols).reset_index(drop=True)
+    key_columns = find_unique_key_columns(old_df, new_df)
+    if not key_columns:
+        return None
+
+    old_records = {make_key_tuple(row, key_columns): (index, row) for index, row in old_df.iterrows()}
+    new_records = {make_key_tuple(row, key_columns): (index, row) for index, row in new_df.iterrows()}
+    old_keys = set(old_records.keys())
+    new_keys = set(new_records.keys())
+    value_columns = [column for column in old_df.columns if column in new_df.columns and column not in key_columns]
+
+    changed_rows = []
+    for key in sorted(old_keys.intersection(new_keys)):
+        old_index, old_row = old_records[key]
+        new_index, new_row = new_records[key]
+        for column in value_columns:
+            old_value = get_display_value(old_row, column)
+            new_value = get_display_value(new_row, column)
+            if str(old_value) == str(new_value):
+                continue
+            changed_rows.append(
+                {
+                    "key": key_label(key_columns, key),
+                    "old row #": old_index + 1,
+                    "new row #": new_index + 1,
+                    "column": column,
+                    "old value": old_value,
+                    "new value": new_value,
+                }
+            )
+
+    removed_rows = []
+    for key in sorted(old_keys.difference(new_keys)):
+        old_index, old_row = old_records[key]
+        removed_rows.append(
+            {
+                "key": key_label(key_columns, key),
+                "old row #": old_index + 1,
+                **{column: get_display_value(old_row, column) for column in old_df.columns},
+            }
+        )
+
+    added_rows = []
+    for key in sorted(new_keys.difference(old_keys)):
+        new_index, new_row = new_records[key]
+        added_rows.append(
+            {
+                "key": key_label(key_columns, key),
+                "new row #": new_index + 1,
+                **{column: get_display_value(new_row, column) for column in new_df.columns},
+            }
+        )
+
+    return {
+        "key_columns": key_columns,
+        "changed_cells": pd.DataFrame(changed_rows),
+        "removed_rows": pd.DataFrame(removed_rows),
+        "added_rows": pd.DataFrame(added_rows),
+    }
+
+
 def build_row_by_row_change_table(old_df, new_df, ignore_cols):
     if old_df is None or new_df is None:
         return pd.DataFrame()
@@ -462,7 +568,7 @@ def color_status(value):
     return "background-color: #fff3cd"
 
 
-def display_diff_results(status, diff_df, rows_old, rows_new, row_by_row_changes=None):
+def display_diff_results(status, diff_df, rows_old, rows_new, change_details=None):
     m1, m2, m3 = st.columns(3)
     m1.metric("rows in old file", rows_old)
     m2.metric("rows in new file", rows_new, delta=(rows_new - rows_old))
@@ -480,9 +586,30 @@ def display_diff_results(status, diff_df, rows_old, rows_new, row_by_row_changes
         old_diff = diff_df[diff_df["_source"] == "OLD"].drop(columns=["_source"])
         new_diff = diff_df[diff_df["_source"] == "NEW"].drop(columns=["_source"])
         st.subheader("changed cells")
-        if row_by_row_changes is not None and not row_by_row_changes.empty:
-            st.caption("Changed cells by original CSV row number, similar to a side-by-side text comparison.")
-            st.dataframe(row_by_row_changes, use_container_width=True, hide_index=True)
+        if isinstance(change_details, dict) and change_details.get("key_columns"):
+            key_columns = ", ".join(change_details["key_columns"])
+            changed_cells = change_details["changed_cells"]
+            removed_rows = change_details["removed_rows"]
+            added_rows = change_details["added_rows"]
+            st.caption(f"Compared rows by stable key columns: {key_columns}.")
+            k1, k2, k3 = st.columns(3)
+            k1.metric("changed cells", len(changed_cells))
+            k2.metric("removed rows", len(removed_rows))
+            k3.metric("added rows", len(added_rows))
+            keyed_tabs = st.tabs([
+                f"changed cells ({len(changed_cells)})",
+                f"removed rows ({len(removed_rows)})",
+                f"added rows ({len(added_rows)})",
+            ])
+            with keyed_tabs[0]:
+                st.dataframe(changed_cells, use_container_width=True, hide_index=True)
+            with keyed_tabs[1]:
+                st.dataframe(removed_rows, use_container_width=True, hide_index=True)
+            with keyed_tabs[2]:
+                st.dataframe(added_rows, use_container_width=True, hide_index=True)
+        elif isinstance(change_details, pd.DataFrame) and not change_details.empty:
+            st.caption("Changed cells by original CSV row number. This is best only when row order has not shifted.")
+            st.dataframe(change_details, use_container_width=True, hide_index=True)
         else:
             simple_change_table = build_simple_change_table(old_diff, new_diff)
             st.caption("Changed row instances after treating the CSV as an unordered set of rows.")
@@ -769,7 +896,7 @@ with st.sidebar:
     csv_suffix_sep = st.text_input("CSV split character:", placeholder="e.g. _ or -")
     st.divider()
     st.header("4. ignore columns")
-    global_ignore_str = st.text_area("global ignore:", "LoadDate, Timestamp, RunID, LastModified")
+    global_ignore_str = st.text_area("global ignore:", "LoadDate, Timestamp, RunID")
     ignore_list = [item.strip() for item in global_ignore_str.split(",") if item.strip()]
 
 if old_zip_files and new_zip_files:
@@ -900,7 +1027,8 @@ if old_zip_files and new_zip_files:
                         *compare_dataframes(old_df, new_df, ignore_list),
                         old_df.shape[0] if old_df is not None else 0,
                         new_df.shape[0] if new_df is not None else 0,
-                        build_row_by_row_change_table(old_df, new_df, ignore_list),
+                        build_keyed_change_tables(old_df, new_df, ignore_list)
+                        or build_row_by_row_change_table(old_df, new_df, ignore_list),
                     )
             else:
                 st.info("No CSV files were auto-matched inside this ZIP pair.")
@@ -934,7 +1062,8 @@ if old_zip_files and new_zip_files:
                         *compare_dataframes(old_df, new_df, ignore_list),
                         old_df.shape[0] if old_df is not None else 0,
                         new_df.shape[0] if new_df is not None else 0,
-                        build_row_by_row_change_table(old_df, new_df, ignore_list),
+                        build_keyed_change_tables(old_df, new_df, ignore_list)
+                        or build_row_by_row_change_table(old_df, new_df, ignore_list),
                     )
             else:
                 st.info("Both selected ZIP files need at least one CSV for manual pairing.")

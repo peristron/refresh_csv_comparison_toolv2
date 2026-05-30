@@ -23,10 +23,14 @@ MAX_COMPRESSION_RATIO = 100
 OLD_ROLE_SUFFIX_TOKENS = {"old", "reference", "ref", "before", "previous", "baseline"}
 NEW_ROLE_SUFFIX_TOKENS = {"new", "target", "after", "updated", "current"}
 KEY_COLUMN_CANDIDATES = [
+    # Common Brightspace/config export identities.
     ["OrgUnitId", "ConfigId", "Name"],
     ["OrgUnitId", "ConfigId"],
     ["ConfigId", "Name"],
+    ["ConfigurationId"],
     ["ConfigId"],
+
+    # Org/tool and org/custom link exports.
     ["Orgid", "toolid"],
     ["OrgId", "ToolId"],
     ["OrgID", "ToolID"],
@@ -34,13 +38,28 @@ KEY_COLUMN_CANDIDATES = [
     ["OwnerOrgUnitId", "CustomLinkId"],
     ["OrgUnitId", "CustomLinkId"],
     ["CustomLinkId"],
+
+    # Common one-column IDs found in the sample refresh backup data.
+    ["WidgetKey"],
+    ["ApplicationId"],
+    ["ToolDeploymentId"],
+    ["RegistrationId", "RedirectUrl"],
+    ["RegistrationCustomParameterId"],
+    ["RegistrationId"],
+    ["LtiLinkId"],
+    ["LtiToolProviderId"],
+    ["TemplateTypeId"],
+    ["PluginId"],
+    ["IMSystemId"],
+    ["IMEndpointId"],
+
+    # Generic fallbacks.
     ["ToolId"],
     ["toolid"],
     ["Id"],
     ["ID"],
 ]
-
-IDENTITY_COLUMN_HINTS = (
+IDENTITY_COLUMN_HINTSIDENTITY_COLUMN_HINTS = (
     "id",
     "key",
     "guid",
@@ -545,6 +564,10 @@ def key_label(key_columns, key_values):
     return " | ".join(f"{column}={value}" for column, value in zip(key_columns, key_values))
 
 
+def key_value_dict(key_columns, key_values):
+    return {column: value for column, value in zip(key_columns, key_values)}
+
+
 def build_keyed_change_tables(old_df, new_df, ignore_cols, key_columns_override=None):
     if old_df is None or new_df is None:
         return None
@@ -584,7 +607,7 @@ def build_keyed_change_tables(old_df, new_df, ignore_cols, key_columns_override=
                 continue
             changed_rows.append(
                 {
-                    "key": key_label(key_columns, key),
+                    **key_value_dict(key_columns, key),
                     "old row #": old_index + 1,
                     "new row #": new_index + 1,
                     "column": column,
@@ -598,9 +621,9 @@ def build_keyed_change_tables(old_df, new_df, ignore_cols, key_columns_override=
         old_index, old_row = old_records[key]
         removed_rows.append(
             {
-                "key": key_label(key_columns, key),
+                **key_value_dict(key_columns, key),
                 "old row #": old_index + 1,
-                **{column: get_display_value(old_row, column) for column in old_df.columns},
+                **{column: get_display_value(old_row, column) for column in old_df.columns if column not in key_columns},
             }
         )
 
@@ -609,9 +632,9 @@ def build_keyed_change_tables(old_df, new_df, ignore_cols, key_columns_override=
         new_index, new_row = new_records[key]
         added_rows.append(
             {
-                "key": key_label(key_columns, key),
+                **key_value_dict(key_columns, key),
                 "new row #": new_index + 1,
-                **{column: get_display_value(new_row, column) for column in new_df.columns},
+                **{column: get_display_value(new_row, column) for column in new_df.columns if column not in key_columns},
             }
         )
 
@@ -783,7 +806,10 @@ def build_change_details(old_df, new_df, ignore_cols, key_columns_override=None)
     keyed_details = build_keyed_change_tables(old_df, new_df, ignore_cols, key_columns_override)
     if isinstance(keyed_details, dict) and keyed_details.get("key_error"):
         return keyed_details
-    return keyed_details or build_row_by_row_change_table(old_df, new_df, ignore_cols)
+    # If no reliable key is available, do not present row-number-based changed cells
+    # by default. For unordered exports, row-position comparison can produce false
+    # positives when rows were inserted, removed, or sorted differently.
+    return keyed_details
 
 
 def color_status(value):
@@ -807,12 +833,12 @@ def display_diff_results(status, diff_df, rows_old, rows_new, change_details=Non
         st.error("Column names do not match.")
     elif diff_df is not None:
         diff_count = len(diff_df)
-        m3.metric("rows with differences", diff_count, delta_color="inverse")
-        st.warning(f"Found {diff_count} differing row instance(s).")
+        m3.metric("differing row instances", diff_count, delta_color="inverse")
+        st.warning(f"Found {diff_count} differing row instance(s) after applying selected ignore columns.")
         old_diff = diff_df[diff_df["_source"] == "OLD"].drop(columns=["_source"])
         new_diff = diff_df[diff_df["_source"] == "NEW"].drop(columns=["_source"])
         if isinstance(change_details, dict) and change_details.get("key_error"):
-            st.subheader("changed cells")
+            st.subheader("keyed difference view")
             st.warning(f"Keyed comparison could not be used: {change_details['key_error']}")
             change_details = None
 
@@ -839,14 +865,13 @@ def display_diff_results(status, diff_df, rows_old, rows_new, change_details=Non
                 st.dataframe(removed_rows, use_container_width=True, hide_index=True)
             with keyed_tabs[2]:
                 st.dataframe(added_rows, use_container_width=True, hide_index=True)
-        elif isinstance(change_details, pd.DataFrame) and not change_details.empty:
-            st.subheader("changed cells")
-            st.caption("Changed cells by original CSV row number. This is best only when row order has not shifted.")
-            st.dataframe(change_details, use_container_width=True, hide_index=True)
         else:
-            st.subheader("changed row instances")
+            st.subheader("unordered row difference view")
             simple_change_table = build_simple_change_table(old_diff, new_diff)
-            st.caption("Changed row instances after treating the CSV as an unordered set of rows.")
+            st.caption(
+                "No reliable key was selected or inferred, so the app is showing old/new "
+                "differing row instances instead of assuming row numbers line up."
+            )
             st.dataframe(simple_change_table, use_container_width=True, hide_index=True)
         t1, t2 = st.tabs([f"old differing rows ({len(old_diff)})", f"new differing rows ({len(new_diff)})"])
         with t1:
@@ -893,7 +918,11 @@ def analyze_zip_pair(
         new_csv_prefix,
         csv_suffix_sep,
     )
-    common_csv_keys = sorted(set(old_csv_map.keys()).intersection(set(new_csv_map.keys())))
+    old_csv_keys = set(old_csv_map.keys())
+    new_csv_keys = set(new_csv_map.keys())
+    common_csv_keys = sorted(old_csv_keys.intersection(new_csv_keys))
+    old_only_csv_keys = sorted(old_csv_keys.difference(new_csv_keys))
+    new_only_csv_keys = sorted(new_csv_keys.difference(old_csv_keys))
 
     status_rows = []
     for csv_key in common_csv_keys:
@@ -915,6 +944,40 @@ def analyze_zip_pair(
             }
         )
 
+    for csv_key in old_only_csv_keys:
+        old_df = read_csv_from_zip(old_zip, old_csv_map[csv_key])
+        status_rows.append(
+            {
+                "zip pair": zip_pair_key,
+                "normalized csv name": csv_key,
+                "status": "Missing in new",
+                "rows old": old_df.shape[0] if old_df is not None else 0,
+                "rows new": 0,
+                "diff rows": old_df.shape[0] if old_df is not None else 0,
+                "old zip": uploaded_name(old_zip),
+                "new zip": uploaded_name(new_zip),
+                "old file": old_csv_map[csv_key],
+                "new file": "",
+            }
+        )
+
+    for csv_key in new_only_csv_keys:
+        new_df = read_csv_from_zip(new_zip, new_csv_map[csv_key])
+        status_rows.append(
+            {
+                "zip pair": zip_pair_key,
+                "normalized csv name": csv_key,
+                "status": "Missing in old",
+                "rows old": 0,
+                "rows new": new_df.shape[0] if new_df is not None else 0,
+                "diff rows": new_df.shape[0] if new_df is not None else 0,
+                "old zip": uploaded_name(old_zip),
+                "new zip": uploaded_name(new_zip),
+                "old file": "",
+                "new file": new_csv_map[csv_key],
+            }
+        )
+
     return {
         "zip_pair_key": zip_pair_key,
         "old_zip": old_zip,
@@ -928,6 +991,8 @@ def analyze_zip_pair(
         "old_csv_collisions": old_csv_collisions,
         "new_csv_collisions": new_csv_collisions,
         "common_csv_keys": common_csv_keys,
+        "old_only_csv_keys": old_only_csv_keys,
+        "new_only_csv_keys": new_only_csv_keys,
         "status_rows": status_rows,
     }
 
@@ -1045,14 +1110,17 @@ with st.expander("how to use this app", expanded=True):
            - **cloud/community mode:** convenient, but uploaded ZIP/CSV content is processed on the server running this app.
            - **local mode:** preferred for confidential or sensitive CSVs; download the standalone script from the sidebar and run it on your own computer.
         2. upload one or more **old/reference ZIPs** and the matching **new/target ZIPs** in the sidebar.
-        3. use the **ZIP auto-match logic** settings if old and new ZIP filenames need normalization before pairing.
-           The app can also fall back to common trailing role words such as `old`, `reference`, `new`, and `target`.
-        4. use the **CSV auto-match logic** settings if filenames inside the ZIPs need normalization before pairing.
-        5. list columns to ignore, such as load timestamps, run IDs, or batch IDs.
-        6. review the **global status report** across all auto-paired ZIP sets.
-        7. download the summary CSV or full report ZIP if you want to share or archive the results.
-        8. inspect individual CSV comparisons in detail, or use manual ZIP/CSV pairing when needed.
-        9. use **clear uploaded data** when finished to reset upload widgets and session state.
+        3. use **ZIP auto-match logic** only when ZIP names need normalization before pairing. The app can also handle date-prefixed backup names and common trailing role words such as `old`, `reference`, `new`, and `target`.
+        4. use **CSV auto-match logic** only when CSV names inside the ZIPs need normalization before pairing.
+        5. add columns to **columns to ignore globally** for values that should not count as meaningful differences, such as `LoadDate`, `Timestamp`, `RunID`, or `LastModified`.
+        6. review the **global status report** for the high-level match/mismatch result across all auto-paired ZIP results, including matched and one-sided CSV files.
+        7. inspect individual CSV comparisons in **detailed inspection**:
+           - The app treats CSVs as unordered data, so rows can move without automatically counting as changed.
+           - When stable key columns are available, the app shows a **keyed difference view** with changed cells, removed rows, and added rows.
+           - When no reliable key is available, the app shows the old/new differing row instances from the unordered comparison instead of assuming row numbers line up.
+        8. use **comparison key override** when the auto-inferred key is missing or wrong. Pick key columns from the multiselect, or type comma-separated columns such as `Orgid, toolid`.
+        9. download the summary CSV or detailed report ZIP if you want to share or archive the results.
+        10. use **clear uploaded data** when finished to reset upload widgets and session state.
 
         **privacy and security best practices**
         - use the local version for highly sensitive, regulated, client, financial, HR, or legal data.
@@ -1130,7 +1198,7 @@ with st.sidebar:
     csv_suffix_sep = st.text_input("CSV split character:", placeholder="e.g. _ or -")
     st.divider()
     st.header("4. ignore columns")
-    global_ignore_str = st.text_area("global ignore:", "LoadDate, Timestamp, RunID, LastModified")
+    global_ignore_str = st.text_area("columns to ignore globally:", "LoadDate, Timestamp, RunID")
     ignore_list = [item.strip() for item in global_ignore_str.split(",") if item.strip()]
 
 if old_zip_files and new_zip_files:
@@ -1207,7 +1275,7 @@ if old_zip_files and new_zip_files:
 
     total_csv_pairs = len(all_status_rows)
     st.divider()
-    st.subheader(f"global status report ({total_csv_pairs} csv pairs across {len(pair_results)} zip pairs)")
+    st.subheader(f"global status report ({total_csv_pairs} csv file results across {len(pair_results)} zip pairs)")
 
     if all_status_rows:
         summary_df = pd.DataFrame(all_status_rows)
@@ -1231,7 +1299,7 @@ if old_zip_files and new_zip_files:
                 mime="application/zip",
             )
     else:
-        st.warning("No auto-matched CSV pairs were found across the auto-paired ZIP sets.")
+        st.warning("No auto-matched CSV files were found across the auto-paired ZIP sets.")
 
     st.divider()
     st.header("detailed inspection")

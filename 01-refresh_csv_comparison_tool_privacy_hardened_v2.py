@@ -1140,7 +1140,7 @@ with st.expander("privacy note", expanded=False):
     st.markdown(
         """
         This app reduces retention by processing uploaded files in memory and avoiding Streamlit caching for uploaded content.
-        That is not the same as end-to-end or zero-knowledge privacy: in the cloud version, the server still receives and processes the uploaded data.
+        That is not the same as end-to-end or zero-knowledge privacy: in the cloud version, the server still receives and processes the uploaded data. So, for example: watch out for comparing files that have keys exposed.
         """
     )
 

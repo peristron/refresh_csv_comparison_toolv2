@@ -52,7 +52,7 @@ KEY_COLUMN_CANDIDATES = [
     ["Id"],
     ["ID"],
 ]
-IDENTITY_COLUMN_HINTSIDENTITY_COLUMN_HINTS = (
+IDENTITY_COLUMN_HINTS = (
     "id",
     "key",
     "guid",
@@ -720,6 +720,7 @@ def render_key_controls(old_df, new_df, ignore_cols, widget_key):
         return []
 
     selected_columns = []
+    manual_override_used = False
     with st.expander("comparison key override", expanded=False):
         if inferred:
             st.caption(f"auto-inferred key: {', '.join(inferred)}")
@@ -739,6 +740,9 @@ def render_key_controls(old_df, new_df, ignore_cols, widget_key):
         )
         if typed_columns.strip():
             selected_columns = parse_key_columns_text(typed_columns)
+            manual_override_used = bool(selected_columns)
+        else:
+            manual_override_used = selected_columns != inferred
 
         st.caption(
             "Tip: choose columns that identify the same record in both files. "
@@ -758,7 +762,7 @@ def render_key_controls(old_df, new_df, ignore_cols, widget_key):
                     f"matching keys={stats['overlap_count']}"
                 )
 
-    return selected_columns
+    return selected_columns if manual_override_used else []
 
 
 def build_change_details(old_df, new_df, ignore_cols, key_columns_override=None):
